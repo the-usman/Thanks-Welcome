@@ -1,0 +1,4 @@
+# One prompt per line. Lines starting with # are ignored.
+a cozy cabin in a snowy forest at night, warm window light, 35mm photo
+a cyberpunk street market in the rain, neon reflections
+a watercolor painting of a lighthouse at sunrise

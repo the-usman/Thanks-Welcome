@@ -1,0 +1,11 @@
+{
+  "daily_limit": 50,
+  "headless": true,
+  "output_dir": "outputs",
+  "video_timeout_s": 900,
+  "delay_between_jobs_s": 8,
+  "selectors": {
+    "prompt": ["textarea[placeholder*='prompt' i]", "textarea"],
+    "generate": ["button:has-text('Generate')", "button:has-text('Run')"]
+  }
+}
