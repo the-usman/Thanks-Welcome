@@ -192,11 +192,13 @@ def load_cookies(path: str) -> list[dict]:
                 "domain": domain, "path": cpath, "secure": secure.upper() == "TRUE",
                 "expires": int(expires) or None, "name": name, "value": value, "httpOnly": http_only,
             }))
-    else:  # raw Cookie header: "a=1; b=2"
+    else:  # raw Cookie header "a=1; b=2" (Set-Cookie attributes like Max-Age are skipped)
+        attrs = {"path", "domain", "expires", "max-age", "samesite", "secure", "httponly", "partitioned", "priority"}
         cookies = [
             _pw_cookie({"name": k.strip(), "value": v.strip()})
-            for k, _, v in (pair.partition("=") for pair in text.removeprefix("Cookie:").split(";"))
-            if k.strip()
+            for line in text.splitlines()
+            for k, sep, v in (pair.partition("=") for pair in re.sub(r"^(Set-)?Cookie:", "", line.strip(), flags=re.I).split(";"))
+            if sep and k.strip() and k.strip().lower() not in attrs
         ]
 
     cookies = [c for c in cookies if "fal" in c["domain"]]
