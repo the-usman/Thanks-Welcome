@@ -1,3 +1,5 @@
 outputs/
 config.json
 __pycache__/
+cookies.json
+cookies.txt

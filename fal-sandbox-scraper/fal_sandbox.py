@@ -2,12 +2,12 @@
 """
 fal.ai Sandbox automation built on Scrapling's StealthyFetcher.
 
-Drives the fal.ai Sandbox web UI with *your own* logged-in account and saves
-the generated images / videos to disk. A local daily counter makes sure the
+Drives the fal.ai Sandbox web UI with *your own* account (via cookies you
+export from your browser) and saves the generated images / videos to disk. A local daily counter makes sure the
 tool stops at your free daily allowance instead of running past it.
 
 Usage:
-    python fal_sandbox.py login                       # one-time: sign in, session is saved
+    # put your exported fal.ai cookies in cookies.json (or cookies.txt) first
     python fal_sandbox.py image "a red fox in snow"   # generate an image
     python fal_sandbox.py video "waves at sunset"     # generate a video
     python fal_sandbox.py batch prompts.txt --mode image
@@ -43,7 +43,9 @@ DEFAULT_CONFIG = {
     "sandbox_url": "https://fal.ai/sandbox",
     "daily_limit": 50,
     "output_dir": "outputs",
-    "profile_dir": str(HOME / "profile"),
+    # Exported fal.ai cookies: Cookie-Editor / EditThisCookie JSON, Netscape
+    # cookies.txt, or a raw "name=value; name2=value2" Cookie header string.
+    "cookies_file": "cookies.json",
     "usage_file": str(HOME / "usage.json"),
     "headless": True,
     "humanize": True,
@@ -136,6 +138,74 @@ class QuotaExhausted(RuntimeError):
 
 
 # --------------------------------------------------------------------------- #
+# Cookies
+# --------------------------------------------------------------------------- #
+_SAME_SITE = {"strict": "Strict", "lax": "Lax", "none": "None", "no_restriction": "None"}
+
+
+def _pw_cookie(c: dict) -> dict:
+    """Convert a browser-extension cookie export entry to Playwright's format."""
+    out = {
+        "name": c["name"],
+        "value": str(c["value"]),
+        "domain": c.get("domain") or ".fal.ai",
+        "path": c.get("path") or "/",
+        "secure": bool(c.get("secure", True)),
+        "httpOnly": bool(c.get("httpOnly", False)),
+    }
+    expires = c.get("expires", c.get("expirationDate"))
+    if expires not in (None, -1) and not c.get("session"):
+        out["expires"] = int(float(expires))
+    same_site = _SAME_SITE.get(str(c.get("sameSite", "")).lower())
+    if same_site:
+        out["sameSite"] = same_site
+        if same_site == "None":
+            out["secure"] = True
+    return out
+
+
+def load_cookies(path: str) -> list[dict]:
+    file = Path(path)
+    if not file.exists():
+        sys.exit(
+            f"Cookie file '{path}' not found.\n"
+            "Export your fal.ai cookies (e.g. with the Cookie-Editor extension -> Export -> JSON)\n"
+            "and save them there, or pass --cookies PATH."
+        )
+    text = file.read_text().strip()
+
+    if text.startswith(("[", "{")):  # JSON export
+        data = json.loads(text)
+        if isinstance(data, dict):
+            data = data.get("cookies", [data])
+        cookies = [_pw_cookie(c) for c in data]
+    elif "\t" in text:  # Netscape cookies.txt
+        cookies = []
+        for line in text.splitlines():
+            http_only = line.startswith("#HttpOnly_")
+            if http_only:
+                line = line[len("#HttpOnly_"):]
+            if not line or line.startswith("#"):
+                continue
+            domain, _sub, cpath, secure, expires, name, value = line.split("\t")[:7]
+            cookies.append(_pw_cookie({
+                "domain": domain, "path": cpath, "secure": secure.upper() == "TRUE",
+                "expires": int(expires) or None, "name": name, "value": value, "httpOnly": http_only,
+            }))
+    else:  # raw Cookie header: "a=1; b=2"
+        cookies = [
+            _pw_cookie({"name": k.strip(), "value": v.strip()})
+            for k, _, v in (pair.partition("=") for pair in text.removeprefix("Cookie:").split(";"))
+            if k.strip()
+        ]
+
+    cookies = [c for c in cookies if "fal" in c["domain"]]
+    if not cookies:
+        sys.exit(f"No fal.ai cookies found in '{path}'.")
+    return cookies
+
+
+# --------------------------------------------------------------------------- #
 # Scrapling helpers
 # --------------------------------------------------------------------------- #
 def _supported_kwargs(fn: Callable, kwargs: dict) -> dict:
@@ -147,12 +217,10 @@ def _supported_kwargs(fn: Callable, kwargs: dict) -> dict:
 
 
 def browser_kwargs(cfg: dict, headless: bool | None = None) -> dict:
-    Path(cfg["profile_dir"]).mkdir(parents=True, exist_ok=True)
     return {
         "headless": cfg["headless"] if headless is None else headless,
         "humanize": cfg["humanize"],
         "solve_cloudflare": cfg["solve_cloudflare"],
-        "user_data_dir": cfg["profile_dir"],  # keeps you logged in between runs
         "network_idle": True,
         "timeout": 90_000,
     }
@@ -185,7 +253,9 @@ def page_has_quota_message(page, phrases: list[str]) -> bool:
 # --------------------------------------------------------------------------- #
 # The generation page action
 # --------------------------------------------------------------------------- #
-def make_generate_action(cfg: dict, prompt: str, mode: str, model: str | None, out_dir: Path, result: dict):
+def make_generate_action(
+    cfg: dict, prompt: str, mode: str, model: str | None, out_dir: Path, result: dict, cookies: list[dict]
+):
     sel = cfg["selectors"]
     media_re = re.compile(cfg["media_url_pattern"])
     want = "video/" if mode == "video" else "image/"
@@ -209,7 +279,10 @@ def make_generate_action(cfg: dict, prompt: str, mode: str, model: str | None, o
             except Exception:
                 pass
 
+        # Load your account cookies into the browser, then reload as you.
+        page.context.add_cookies(cookies)
         page.on("response", on_response)
+        page.reload(wait_until="networkidle")
         page.wait_for_timeout(1500)
 
         if page_has_quota_message(page, cfg["quota_exhausted_text"]):
@@ -294,25 +367,13 @@ def make_generate_action(cfg: dict, prompt: str, mode: str, model: str | None, o
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
-def cmd_login(cfg: dict, _args) -> None:
-    print("A browser window will open. Sign in to fal.ai, then come back here and press Enter.")
-
-    def wait_for_user(page):
-        input("Press Enter once you are logged in... ")
-        return page
-
-    kw = browser_kwargs(cfg, headless=False)
-    kw["page_action"] = wait_for_user
-    StealthyFetcher.fetch(cfg["sandbox_url"], **_supported_kwargs(StealthyFetcher.fetch, kw))
-    print(f"Session saved in {cfg['profile_dir']}")
-
-
 def cmd_status(cfg: dict, _args) -> None:
     q = QuotaTracker(cfg["usage_file"], cfg["daily_limit"])
     print(f"Today: {q.used_today}/{q.limit} used, {q.remaining} remaining")
 
 
 def run_jobs(cfg: dict, prompts: list[str], mode: str, model: str | None, headless: bool | None) -> int:
+    cookies = load_cookies(cfg["cookies_file"])
     quota = QuotaTracker(cfg["usage_file"], cfg["daily_limit"])
     out_dir = Path(cfg["output_dir"]) / mode
     if quota.remaining == 0:
@@ -329,7 +390,7 @@ def run_jobs(cfg: dict, prompts: list[str], mode: str, model: str | None, headle
     def one(fetch: Callable, prompt: str) -> None:
         nonlocal failures
         result: dict = {}
-        action = make_generate_action(cfg, prompt, mode, model, out_dir, result)
+        action = make_generate_action(cfg, prompt, mode, model, out_dir, result, cookies)
         fetch(cfg["sandbox_url"], **_supported_kwargs(fetch, {**kw, "page_action": action}))
         if result.get("quota_exhausted"):
             quota.mark_exhausted()
@@ -368,9 +429,9 @@ def run_jobs(cfg: dict, prompts: list[str], mode: str, model: str | None, headle
 def main() -> int:
     ap = argparse.ArgumentParser(description="fal.ai Sandbox image/video generator (Scrapling stealth mode)")
     ap.add_argument("--show", action="store_true", help="show the browser window")
+    ap.add_argument("--cookies", help="path to exported fal.ai cookies (default: cookies.json)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("login", help="open a browser to sign in once (session is saved)")
     sub.add_parser("status", help="show today's usage")
 
     for mode in ("image", "video"):
@@ -386,10 +447,8 @@ def main() -> int:
     args = ap.parse_args()
     cfg = load_config()
     headless = False if args.show else None
-
-    if args.cmd == "login":
-        cmd_login(cfg, args)
-        return 0
+    if args.cookies:
+        cfg["cookies_file"] = args.cookies
     if args.cmd == "status":
         cmd_status(cfg, args)
         return 0
